@@ -1,0 +1,52 @@
+{
+  "name": "delete",
+  "version": "1.0.0-0.0",
+  "description": "Lambda for deleting an item",
+  "main": "lib/index",
+  "files": [
+    "lib"
+  ],
+  "types": "lib/index",
+  "scripts": {
+    "clean": "rimraf lib && rimraf coverage && rimraf webpack",
+    "format": "prettier --write \"{src,__tests__}/**/*.ts\" --single-quote --trailing-comma es5",
+    "lint": "tslint --force --format verbose \"src/**/*.ts\"",
+    "updateVersion": "npm version prerelease --preid=$BUILD_NUMBER --allow-same-version",
+    "prebuild": "npm run updateVersion && npm run clean && npm run format && npm run lint && echo Using TypeScript && tsc --version",
+    "build": "npm run clean && tsc --pretty",
+    "package": "webpack -p --env.FILENAME=$(node -p \"require('./package.json').name\")-$(node -p \"require('./package.json').version\")",
+    "coverage": "jest --coverage --coverageThreshold='{\"global\":{\"branches\":75,\"functions\":100,\"lines\":100,\"statements\":100}}'",
+    "test": "jest",
+    "watch": "npm run build -- --watch",
+    "watch:test": "jest --watch"
+  },
+  "dependencies": {
+    "aws-lambda": "^1.0.5",
+    "aws-sdk": "^2.600.0",
+    "guid-typescript": "^1.0.9",
+    "winston": "^3.2.1"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.17",
+    "@types/jest": "^25.1.2",
+    "@types/node": "^13.1.6",
+    "aws-sdk-mock": "^5.0.0",
+    "jest": "^24.9.0",
+    "prettier": "^1.19.1",
+    "rimraf": "^3.0.0",
+    "ts-jest": "^24.3.0",
+    "tslint": "^5.20.1",
+    "tslint-config-prettier": "^1.18.0",
+    "typescript": "^3.2.4",
+    "webpack": "^4.29.0",
+    "webpack-cli": "^3.3.10",
+    "zip-webpack-plugin": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=12.14.1"
+  },
+  "jest": {
+    "preset": "ts-jest"
+  },
+  "license": "MIT"
+}

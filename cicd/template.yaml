@@ -1,0 +1,1737 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stack for notication service
+Parameters:
+    AlarmActionArn:
+        Type: String
+    AlarmDynamoDBSystemErrorsThreshold:
+        Type: Number
+        Default: 50
+    AlarmLambdaErrorsThreshold:
+        Type: Number
+        Default: 50
+    Alarm4XXsThreshold:
+        Type: Number
+        Default: 50
+    Alarm5XXsThreshold:
+        Type: Number
+        Default: 50
+    CertificateArn:
+        Type: String
+    CreateFileName:
+        Type: String
+    CreateQueueMessageRetentionPeriod:
+        Type: Number
+        Default: 345600
+    CreateQueueSNSTopicArn:
+        Type: String
+    DefaultLoglevel:
+        Type: String
+        Default: info
+    DeleteFileName:
+        Type: String
+    EnvironmentName:
+        Type: String
+        AllowedValues:
+            - development
+            - integration
+            - testing
+            - staging
+            - production
+        Description: Environment name
+    FetchFileName:
+        Type: String
+    GetFileName:
+        Type: String
+    HostedZoneUrl:
+        Type: String
+    RepositoryBucketName:
+        Type: String
+    ServiceName:
+        Type: String
+        Default: notification
+    UserPoolId:
+        Type: String
+    UserWebClientId:
+        Type: String
+    UserJWTIssuer:
+        Type: String
+Conditions:
+    CreateResources: !Not [ !Equals [!Ref EnvironmentName, development]]
+Resources:
+    DnsRecord:
+        Type: AWS::Route53::RecordSet
+        Condition: CreateResources
+        Properties:
+            Name: !Sub ${ServiceName}.${HostedZoneUrl}
+            AliasTarget:
+                DNSName: !GetAtt APIGatewayDomainName.RegionalDomainName
+                HostedZoneId: !GetAtt APIGatewayDomainName.RegionalHostedZoneId
+            HostedZoneName: !Sub ${HostedZoneUrl}.
+            Type: A
+
+    APIGatewayDomainName:
+        Type: AWS::ApiGatewayV2::DomainName
+        Condition: CreateResources
+        Properties:
+            DomainName: !Sub ${ServiceName}.${HostedZoneUrl}
+            DomainNameConfigurations:
+                -   CertificateArn: !Ref CertificateArn
+                    EndpointType: REGIONAL
+            Tags:
+                Environment: !Ref EnvironmentName
+                Name: !Ref ServiceName
+                Service: !Ref ServiceName
+    APIGatewayMappingV1:
+        Type: AWS::ApiGatewayV2::ApiMapping
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            ApiMappingKey: api
+            DomainName: !Ref APIGatewayDomainName
+            Stage: !Ref APIGatewayStage
+
+    APIGateway:
+        Type: AWS::ApiGatewayV2::Api
+        Condition: CreateResources
+        Properties:
+            Name: !Sub ${ServiceName}-${EnvironmentName}-api
+            Description: !Sub HTTP API Gateway for ${ServiceName} ${EnvironmentName}
+            ProtocolType: HTTP
+            CorsConfiguration:
+                AllowCredentials: true
+                AllowHeaders:
+                    - Authorization
+                    - Accept
+                AllowMethods:
+                    - DELETE
+                    - GET
+                    - POST
+                AllowOrigins:
+                    - https://console.thoud.co
+                    - https://manage.thoud.co
+                    - https://admin.thoud.co
+                    - http://localhost:3000
+                MaxAge: 1
+            Tags:
+                Environment: !Ref EnvironmentName
+                Name: !Ref ServiceName
+                Service: !Ref ServiceName
+    APIGatewayUserAuthorizer:
+        Type: AWS::ApiGatewayV2::Authorizer
+        Condition: CreateResources
+        Properties:
+            Name: !Sub ${ServiceName}-${EnvironmentName}-user
+            ApiId: !Ref APIGateway
+            AuthorizerType: JWT
+            JwtConfiguration:
+                Audience:
+                    - !Ref UserWebClientId
+                Issuer: !Ref UserJWTIssuer
+            IdentitySource:
+                - $request.header.Authorization
+    GatewayLambdaRole:
+        Type: AWS::IAM::Role
+        Condition: CreateResources
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - apigateway.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            Description: !Sub Role for ${ServiceName} api gateway
+            RoleName: !Sub ${ServiceName}-${EnvironmentName}-api-gateway
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    GatewayLambdaPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-api-gateway
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action: 'lambda:InvokeFunction'
+                        Resource: !GetAtt DeleteLambda.Arn
+                    -   Effect: Allow
+                        Action: 'lambda:InvokeFunction'
+                        Resource: !GetAtt FetchLambda.Arn
+                    -   Effect: Allow
+                        Action: 'lambda:InvokeFunction'
+                        Resource: !GetAtt GetLambda.Arn
+            Roles:
+                - !Ref GatewayLambdaRole
+    APIGatewayStage:
+        Type: AWS::ApiGatewayV2::Stage
+        Condition: CreateResources
+        Properties:
+            AccessLogSettings:
+                DestinationArn: !GetAtt APIGatewayStageLogGroup.Arn
+                Format: >-
+                    { "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","routeKey":"$context.routeKey", "status":"$context.status","protocol":"$context.protocol", "responseLength":"$context.responseLength"}
+            ApiId: !Ref APIGateway
+            AutoDeploy: true
+            DefaultRouteSettings:
+                DetailedMetricsEnabled: true
+            Description: !Sub API Gateway default stage for the ${ServiceName} lambda
+            StageName: $default
+            Tags:
+                Environment: !Ref EnvironmentName
+                Name: !Ref ServiceName
+                Service: !Ref ServiceName
+    APIGatewayStageLogGroup:
+        Type: AWS::Logs::LogGroup
+        Condition: CreateResources
+        Properties:
+            LogGroupName: !Sub /aws/api-gateway-stage/${ServiceName}-${EnvironmentName}
+            RetentionInDays: 14
+    UserResourceServer:
+        Type: AWS::Cognito::UserPoolResourceServer
+        Condition: CreateResources
+        Properties:
+            Identifier: !Sub https://${DnsRecord}
+            Name: !Ref ServiceName
+            Scopes:
+                -   ScopeDescription: !Sub Scope to delete ${ServiceName} items
+                    ScopeName: !Sub delete:${ServiceName}
+                -   ScopeDescription: !Sub Scope to fetch ${ServiceName} items
+                    ScopeName: !Sub fetch:${ServiceName}
+                -   ScopeDescription: !Sub Scope to get ${ServiceName} items
+                    ScopeName: !Sub get:${ServiceName}
+            UserPoolId: !Ref UserPoolId
+
+    DeleteLambdaPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !Ref DeleteLambda
+            Principal: apigateway.amazonaws.com
+            SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/DELETE/v1/user/notification/{notificationId}/
+    DeleteAPIGatewayIntegration:
+        Type: AWS::ApiGatewayV2::Integration
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            CredentialsArn: !GetAtt GatewayLambdaRole.Arn
+            Description: !Sub API Gateway integration for the delete ${ServiceName} endpoint
+            IntegrationMethod: POST
+            IntegrationType: AWS_PROXY
+            IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteLambda.Arn}/invocations
+            PayloadFormatVersion: 1.0
+            TimeoutInMillis: 5000
+    DeleteAPIGatewayRoutes:
+        Type: AWS::ApiGatewayV2::Route
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            AuthorizationScopes:
+                - !Sub https://${DnsRecord}/delete:${ServiceName}
+            AuthorizationType: JWT
+            AuthorizerId: !Ref APIGatewayUserAuthorizer
+            RouteKey: !Sub DELETE /v1/user/${ServiceName}/{${ServiceName}Id}
+            Target: !Sub integrations/${DeleteAPIGatewayIntegration}
+    DeleteLambda:
+        Type: AWS::Lambda::Function
+        Condition: CreateResources
+        Properties:
+            Code:
+                S3Bucket: !Ref RepositoryBucketName
+                S3Key: !Sub 'delete/${DeleteFileName}'
+            Description: !Sub Lambda for deleting ${ServiceName} items
+            Environment:
+                Variables:
+                    LogLevel: !Ref DefaultLoglevel
+                    TableName: !Ref DynamoDB
+            FunctionName: !Sub ${ServiceName}-${EnvironmentName}-delete
+            Handler: Index.handler
+            MemorySize: 192
+            Role: !GetAtt DeleteLambdaRole.Arn
+            Runtime: nodejs12.x
+            TracingConfig:
+                Mode: Active
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    DeleteCloudwatchLogGroup:
+        Type: AWS::Logs::LogGroup
+        Condition: CreateResources
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ServiceName}-${EnvironmentName}-delete
+            RetentionInDays: 14
+    DeleteLambdaRole:
+        Type: AWS::IAM::Role
+        Condition: CreateResources
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - lambda.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            Description: !Sub Role for ${ServiceName} delete lambda
+            RoleName: !Sub ${ServiceName}-${EnvironmentName}-delete-lambda
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    DeleteDynamoPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-delete-dynamodb
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - dynamodb:DeleteItem
+                        Resource:
+                            - !Sub ${DynamoDB.Arn}
+                            - !Sub ${DynamoDB.Arn}/*
+            Roles:
+                - !Ref DeleteLambdaRole
+    DeleteCloudWatchPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-delete-cloudwatch
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - logs:CreateLogStream
+                            - logs:PutLogEvents
+                        Resource: !GetAtt DeleteCloudwatchLogGroup.Arn
+            Roles:
+                - !Ref DeleteLambdaRole
+    DeleteXrayPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-delete-xray
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - xray:PutTraceSegments
+                            - xray:PutTelemetryRecords
+                            - xray:GetSamplingRules
+                            - xray:GetSamplingTargets
+                            - xray:GetSamplingStatisticSummaries
+                        Resource: '*'
+            Roles:
+                - !Ref DeleteLambdaRole
+
+    GetLambdaPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !Ref GetLambda
+            Principal: apigateway.amazonaws.com
+            SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/GET/v1/user/notification/{notificationId}/
+    GetAPIGatewayIntegration:
+        Type: AWS::ApiGatewayV2::Integration
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            CredentialsArn: !GetAtt GatewayLambdaRole.Arn
+            Description: !Sub API Gateway integration for the get ${ServiceName} endpoint
+            IntegrationMethod: POST
+            IntegrationType: AWS_PROXY
+            IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetLambda.Arn}/invocations
+            PayloadFormatVersion: 1.0
+            TimeoutInMillis: 5000
+    GetAPIGatewayRoutes:
+        Type: AWS::ApiGatewayV2::Route
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            AuthorizationScopes:
+                - !Sub https://${DnsRecord}/get:${ServiceName}
+            AuthorizationType: JWT
+            AuthorizerId: !Ref APIGatewayUserAuthorizer
+            RouteKey: !Sub GET /v1/user/${ServiceName}/{${ServiceName}Id}
+            Target: !Sub integrations/${GetAPIGatewayIntegration}
+    GetLambda:
+        Type: AWS::Lambda::Function
+        Condition: CreateResources
+        Properties:
+            Code:
+                S3Bucket: !Ref RepositoryBucketName
+                S3Key: !Sub 'get/${GetFileName}'
+            Description: !Sub Lambda for getting ${ServiceName} a notification
+            Environment:
+                Variables:
+                    LogLevel: !Ref DefaultLoglevel
+                    TableName: !Ref DynamoDB
+            FunctionName: !Sub ${ServiceName}-${EnvironmentName}-get
+            Handler: Index.handler
+            MemorySize: 192
+            Role: !GetAtt GetLambdaRole.Arn
+            Runtime: nodejs12.x
+            TracingConfig:
+                Mode: Active
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    GetCloudwatchLogGroup:
+        Type: AWS::Logs::LogGroup
+        Condition: CreateResources
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ServiceName}-${EnvironmentName}-get
+            RetentionInDays: 14
+    GetLambdaRole:
+        Type: AWS::IAM::Role
+        Condition: CreateResources
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - lambda.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            Description: !Sub Role for ${ServiceName} get lambda
+            RoleName: !Sub ${ServiceName}-${EnvironmentName}-get-lambda
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    GetDynamoPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-get-dynamodb
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - dynamodb:GetItem
+                        Resource:
+                            - !Sub ${DynamoDB.Arn}
+                            - !Sub ${DynamoDB.Arn}/*
+            Roles:
+                - !Ref GetLambdaRole
+    GetCloudWatchPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-get-cloudwatch
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - logs:CreateLogStream
+                            - logs:PutLogEvents
+                        Resource: !GetAtt GetCloudwatchLogGroup.Arn
+            Roles:
+                - !Ref GetLambdaRole
+    GetXrayPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-get-xray
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - xray:PutTraceSegments
+                            - xray:PutTelemetryRecords
+                            - xray:GetSamplingRules
+                            - xray:GetSamplingTargets
+                            - xray:GetSamplingStatisticSummaries
+                        Resource: '*'
+            Roles:
+                - !Ref GetLambdaRole
+
+    FetchLambdaPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: lambda:InvokeFunction
+            FunctionName: !Ref FetchLambda
+            Principal: apigateway.amazonaws.com
+            SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*/GET/v1/user/notification/
+    FetchAPIGatewayIntegration:
+        Type: AWS::ApiGatewayV2::Integration
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            CredentialsArn: !GetAtt GatewayLambdaRole.Arn
+            Description: !Sub API Gateway integration for the fetch ${ServiceName} endpoint
+            IntegrationMethod: POST
+            IntegrationType: AWS_PROXY
+            IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FetchLambda.Arn}/invocations
+            PayloadFormatVersion: 1.0
+            TimeoutInMillis: 5000
+    FetchAPIGatewayRoutes:
+        Type: AWS::ApiGatewayV2::Route
+        Condition: CreateResources
+        Properties:
+            ApiId: !Ref APIGateway
+            AuthorizationScopes:
+                - !Sub https://${DnsRecord}/fetch:${ServiceName}
+            AuthorizationType: JWT
+            AuthorizerId: !Ref APIGatewayUserAuthorizer
+            RouteKey: !Sub GET /v1/user/${ServiceName}
+            Target: !Sub integrations/${FetchAPIGatewayIntegration}
+    FetchLambda:
+        Type: AWS::Lambda::Function
+        Condition: CreateResources
+        Properties:
+            Code:
+                S3Bucket: !Ref RepositoryBucketName
+                S3Key: !Sub 'fetch/${FetchFileName}'
+            Description: !Sub Lambda for fetching ${ServiceName} items
+            Environment:
+                Variables:
+                    LogLevel: !Ref DefaultLoglevel
+                    TableName: !Ref DynamoDB
+            FunctionName: !Sub ${ServiceName}-${EnvironmentName}-fetch
+            Handler: Index.handler
+            MemorySize: 192
+            Role: !GetAtt FetchLambdaRole.Arn
+            Runtime: nodejs12.x
+            TracingConfig:
+                Mode: Active
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    FetchCloudwatchLogGroup:
+        Type: AWS::Logs::LogGroup
+        Condition: CreateResources
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ServiceName}-${EnvironmentName}-fetch
+            RetentionInDays: 14
+    FetchLambdaRole:
+        Type: AWS::IAM::Role
+        Condition: CreateResources
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - lambda.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            Description: !Sub Role for ${ServiceName} fetch lambda
+            RoleName: !Sub ${ServiceName}-${EnvironmentName}-fetch-lambda
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    FetchDynamoPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-fetch-dynamodb
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - dynamodb:Query
+                        Resource:
+                            - !Sub ${DynamoDB.Arn}
+                            - !Sub ${DynamoDB.Arn}/*
+            Roles:
+                - !Ref FetchLambdaRole
+    FetchCloudWatchPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-fetch-cloudwatch
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - logs:CreateLogStream
+                            - logs:PutLogEvents
+                        Resource: !GetAtt FetchCloudwatchLogGroup.Arn
+            Roles:
+                - !Ref FetchLambdaRole
+    FetchXrayPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-fetch-xray
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - xray:PutTraceSegments
+                            - xray:PutTelemetryRecords
+                            - xray:GetSamplingRules
+                            - xray:GetSamplingTargets
+                            - xray:GetSamplingStatisticSummaries
+                        Resource: '*'
+            Roles:
+                - !Ref FetchLambdaRole
+
+    CreateQueue:
+        Type: AWS::SQS::Queue
+        Condition: CreateResources
+        Properties:
+            DelaySeconds: 0
+            MessageRetentionPeriod: !Ref CreateQueueMessageRetentionPeriod
+            QueueName: !Sub ${ServiceName}-${EnvironmentName}-create
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    CreateQueuePolicy:
+        Type: AWS::SQS::QueuePolicy
+        Condition: CreateResources
+        Properties:
+            PolicyDocument:
+                Version: 2012-10-17
+                Id: !Sub ${ServiceName}-${EnvironmentName}-queue-policy
+                Statement:
+                    -   Sid: allow-lambda-invoke
+                        Effect: Allow
+                        Principal: '*'
+                        Action:
+                            -   sqs:SendMessage
+                        Resource: !GetAtt CreateQueue.Arn
+            Queues:
+                - !Ref CreateQueue
+    CreateQueueLambdaPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-create-queue-lambda
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - sqs:ReceiveMessage
+                            - sqs:DeleteMessage
+                            - sqs:GetQueueAttributes
+                        Resource: !GetAtt CreateQueue.Arn
+            Roles:
+                - !Ref CreateLambdaRole
+    CreateQueueSubscription:
+        Type: AWS::SNS::Subscription
+        Properties:
+            Endpoint: !GetAtt CreateQueue.Arn
+            Protocol: sqs
+            RawMessageDelivery: true
+            TopicArn: !Ref CreateQueueSNSTopicArn
+    CreateLambdaEventSourceMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        Condition: CreateResources
+        Properties:
+            BatchSize: 10
+            Enabled: true
+            EventSourceArn: !GetAtt CreateQueue.Arn
+            FunctionName: !GetAtt CreateLambda.Arn
+    CreateLambda:
+        Type: AWS::Lambda::Function
+        Condition: CreateResources
+        Properties:
+            Code:
+                S3Bucket: !Ref RepositoryBucketName
+                S3Key: !Sub 'create/${CreateFileName}'
+            Description: !Sub Lambda for creating ${ServiceName} items
+            Environment:
+                Variables:
+                    LogLevel: !Ref DefaultLoglevel
+                    TableName: !Ref DynamoDB
+            FunctionName: !Sub ${ServiceName}-${EnvironmentName}-create
+            Handler: Index.handler
+            MemorySize: 192
+            Role: !GetAtt CreateLambdaRole.Arn
+            Runtime: nodejs12.x
+            TracingConfig:
+                Mode: Active
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    CreateCloudwatchLogGroup:
+        Type: AWS::Logs::LogGroup
+        Condition: CreateResources
+        Properties:
+            LogGroupName: !Sub /aws/lambda/${ServiceName}-${EnvironmentName}-create
+            RetentionInDays: 14
+    CreateLambdaRole:
+        Type: AWS::IAM::Role
+        Condition: CreateResources
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    -   Effect: Allow
+                        Principal:
+                            Service:
+                                - lambda.amazonaws.com
+                        Action:
+                            - sts:AssumeRole
+            Description: !Sub Role for ${ServiceName} create lambda
+            RoleName: !Sub ${ServiceName}-${EnvironmentName}-create-lambda
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+    CreateDynamoPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-create-dynamodb
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - dynamodb:PutItem
+                        Resource:
+                            - !Sub ${DynamoDB.Arn}
+                            - !Sub ${DynamoDB.Arn}/*
+            Roles:
+                - !Ref CreateLambdaRole
+    CreateCloudWatchPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-create-cloudwatch
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - logs:CreateLogStream
+                            - logs:PutLogEvents
+                        Resource: !GetAtt CreateCloudwatchLogGroup.Arn
+            Roles:
+                - !Ref CreateLambdaRole
+    CreateXrayPolicy:
+        Type: AWS::IAM::Policy
+        Condition: CreateResources
+        Properties:
+            PolicyName: !Sub ${ServiceName}-${EnvironmentName}-create-xray
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -   Effect: Allow
+                        Action:
+                            - xray:PutTraceSegments
+                            - xray:PutTelemetryRecords
+                            - xray:GetSamplingRules
+                            - xray:GetSamplingTargets
+                            - xray:GetSamplingStatisticSummaries
+                        Resource: '*'
+            Roles:
+                - !Ref CreateLambdaRole
+
+    Alarm500s:
+        Type: AWS::CloudWatch::Alarm
+        Condition: CreateResources
+        Properties:
+            ActionsEnabled: true
+            AlarmActions:
+                - !Ref AlarmActionArn
+            AlarmDescription: !Sub Monitors 5XX errors for the ${ServiceName} service api gateway
+            AlarmName: !Sub ${ServiceName}-${EnvironmentName}-apigateway-5XX
+            ComparisonOperator: GreaterThanOrEqualToThreshold
+            DatapointsToAlarm: 1
+            Dimensions:
+                -   Name: ApiGatewayName
+                    Value: !Ref APIGateway
+            EvaluationPeriods: 1
+            MetricName: 5XXError
+            Namespace: AWS/ApiGateway
+            OKActions:
+                - !Ref AlarmActionArn
+            Period: 300
+            Statistic: Sum
+            Threshold: !Ref Alarm5XXsThreshold
+            TreatMissingData: notBreaching
+            Unit: Count
+    Alarm400s:
+        Type: AWS::CloudWatch::Alarm
+        Condition: CreateResources
+        Properties:
+            ActionsEnabled: true
+            AlarmActions:
+                - !Ref AlarmActionArn
+            AlarmDescription: !Sub Monitors 4XX errors for the ${ServiceName} service api gateway
+            AlarmName: !Sub ${ServiceName}-${EnvironmentName}-apigateway-4XX
+            ComparisonOperator: GreaterThanOrEqualToThreshold
+            DatapointsToAlarm: 1
+            Dimensions:
+                -   Name: ApiGatewayName
+                    Value: !Ref APIGateway
+            EvaluationPeriods: 1
+            MetricName: 4XXError
+            Namespace: AWS/ApiGateway
+            OKActions:
+                - !Ref AlarmActionArn
+            Period: 300
+            Statistic: Sum
+            Threshold: !Ref Alarm4XXsThreshold
+            TreatMissingData: notBreaching
+            Unit: Count
+    AlarmLambdaErrors:
+        Type: AWS::CloudWatch::Alarm
+        Condition: CreateResources
+        Properties:
+            ActionsEnabled: true
+            AlarmActions:
+                - !Ref AlarmActionArn
+            AlarmDescription: !Sub Monitors ${ServiceName} lambda errors
+            AlarmName: !Sub ${ServiceName}-${EnvironmentName}-lambda-errors
+            ComparisonOperator: GreaterThanOrEqualToThreshold
+            DatapointsToAlarm: 1
+            Dimensions:
+                -   Name: CreateLambda
+                    Value: !Ref CreateLambda
+                -   Name: DeleteLambda
+                    Value: !Ref DeleteLambda
+                -   Name: FetchLambda
+                    Value: !Ref FetchLambda
+            EvaluationPeriods: 1
+            MetricName: Errors
+            Namespace: AWS/Lambda
+            OKActions:
+                - !Ref AlarmActionArn
+            Period: 300
+            Statistic: Sum
+            Threshold: !Ref AlarmLambdaErrorsThreshold
+            TreatMissingData: notBreaching
+            Unit: Count
+    AlarmDynamodbErrors:
+        Type: AWS::CloudWatch::Alarm
+        Condition: CreateResources
+        Properties:
+            ActionsEnabled: true
+            AlarmActions:
+                - !Ref AlarmActionArn
+            AlarmDescription: !Sub Monitors ${ServiceName} DynamoDB system errors
+            AlarmName: !Sub ${ServiceName}-${EnvironmentName}-dynamodb-system-errors
+            ComparisonOperator: GreaterThanOrEqualToThreshold
+            DatapointsToAlarm: 1
+            Dimensions:
+                -   Name: DynamoDB
+                    Value: !Ref DynamoDB
+            EvaluationPeriods: 1
+            MetricName: SystemErrors
+            Namespace: AWS/DynamoDB
+            OKActions:
+                - !Ref AlarmActionArn
+            Period: 300
+            Statistic: Sum
+            Threshold: !Ref AlarmDynamoDBSystemErrorsThreshold
+            TreatMissingData: notBreaching
+            Unit: Count
+    Dashboard:
+        Type: AWS::CloudWatch::Dashboard
+        Condition: CreateResources
+        Properties:
+            DashboardName: !Sub ${ServiceName}-${EnvironmentName}-${AWS::Region}
+            DashboardBody: !Sub >-
+                {
+                    "widgets": [
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 0,
+                            "width": 18,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/ApiGateway", "4xx", "ApiId", "${APIGateway}", { "yAxis": "left" } ],
+                                    [ ".", "5xx", ".", "." ],
+                                    [ ".", "DataProcessed", ".", ".", { "label": "Data Processed" } ],
+                                    [ ".", "Count", ".", "." ],
+                                    [ ".", "IntegrationLatency", ".", ".", { "stat": "Average", "label": "Integration Latency" } ],
+                                    [ ".", "Latency", ".", ".", { "stat": "Average" } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "API Gateway",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 18,
+                            "y": 0,
+                            "width": 3,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ { "expression": "(m1 + m2 + m3 + m4 + m5 + m6) / m7 * 100", "label": "", "id": "e1", "region": "${AWS::Region}" } ],
+                                    [ "AWS/Logs", "IncomingLogEvents", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-delete", { "id": "m1", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-delete", { "id": "m2", "visible": false } ],
+                                    [ "AWS/Logs", "IncomingLogEvents", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-fetch", { "id": "m3", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-fetch", { "id": "m4", "visible": false } ],
+                                    [ "AWS/Logs", "IncomingLogEvents", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-create", { "id": "m5", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-create", { "id": "m6", "visible": false } ],
+                                    [ ".", ".", { "id": "m7", "visible": false } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "setPeriodToTimeRange": true,
+                                "title": "% of total logs"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 21,
+                            "y": 0,
+                            "width": 3,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ { "expression": "m1 + m2 + m3 + m4 + m5 + m6", "label": "", "id": "e1" } ],
+                                    [ "AWS/Logs", "IncomingLogEvents", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-delete", { "id": "m1", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-delete", { "id": "m2", "visible": false } ],
+                                    [ "AWS/Logs", "IncomingLogEvents", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-fetch", { "id": "m3", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-fetch", { "id": "m4", "visible": false } ],
+                                    [ "AWS/Logs", "IncomingLogEvents", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-create", { "id": "m5", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-create", { "id": "m6", "visible": false } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "stacked": false,
+                                "title": "Log Events",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 3,
+                            "width": 12,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-create", "Resource", "${ServiceName}-${EnvironmentName}-create", { "label": "Duration", "stat": "Average" } ],
+                                    [ ".", "Errors", ".", ".", ".", ".", { "label": "Errors" } ],
+                                    [ ".", "Throttles", ".", ".", ".", ".", { "label": "Throttles" } ],
+                                    [ ".", "Invocations", ".", ".", ".", ".", { "label": "Invocations" } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Create Lambda",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 12,
+                            "y": 3,
+                            "width": 9,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "DeleteItem", { "label": "DeleteItem Latency" } ],
+                                    [ "...", "PutItem", { "label": "Put Item Latency" } ],
+                                    [ "...", "Query", { "label": "Query Latency" } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "period": 300,
+                                "title": "Dynamo DB",
+                                "stat": "Average",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 21,
+                            "y": 3,
+                            "width": 3,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ { "expression": "m1 + m2 + m3 + m4 + m5 + m6", "label": "", "id": "e1", "region": "${AWS::Region}" } ],
+                                    [ "AWS/Logs", "879s", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-delete", { "label": "Incoming Bytes", "id": "m1", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-delete", { "label": "Incoming Bytes", "id": "m2", "visible": false } ],
+                                    [ "AWS/Logs", "879s", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-fetch", { "label": "Incoming Bytes", "id": "m3", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-fetch", { "label": "Incoming Bytes", "id": "m4", "visible": false } ],
+                                    [ "AWS/Logs", "879s", "LogGroupName", "/aws/lambda/${ServiceName}-${EnvironmentName}-create", { "label": "Incoming Bytes", "id": "m5", "visible": false } ],
+                                    [ "...", "/aws/api-gateway-stage/${ServiceName}-${EnvironmentName}-create", { "label": "Incoming Bytes", "id": "m6", "visible": false } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "stacked": false,
+                                "title": "Incoming Bytes",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 6,
+                            "width": 12,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-delete", "Resource", "${ServiceName}-${EnvironmentName}-delete", { "label": "Duration", "stat": "Average" } ],
+                                    [ ".", "Errors", ".", ".", ".", ".", { "label": "Errors" } ],
+                                    [ ".", "Throttles", ".", ".", ".", ".", { "label": "Throttles" } ],
+                                    [ ".", "Invocations", ".", ".", ".", ".", { "label": "Invocations" } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Delete Lambda",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 12,
+                            "y": 6,
+                            "width": 12,
+                            "height": 9,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${ServiceName}-${EnvironmentName}", { "yAxis": "left" } ],
+                                    [ ".", "ConsumedReadCapacityUnits", ".", ".", { "yAxis": "left" } ],
+                                    [ ".", "ReadThrottleEvents", ".", ".", { "yAxis": "right" } ],
+                                    [ ".", "WriteThrottleEvents", ".", ".", { "yAxis": "right" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Maximum",
+                                "period": 300,
+                                "title": "Read Capacity & Throttle Events"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 9,
+                            "width": 12,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-fetch", "Resource", "${ServiceName}-${EnvironmentName}-fetch", { "label": "Duration", "stat": "Average" } ],
+                                    [ ".", "Errors", ".", ".", ".", ".", { "label": "Errors" } ],
+                                    [ ".", "Throttles", ".", ".", ".", ".", { "label": "Throttles" } ],
+                                    [ ".", "Invocations", ".", ".", ".", ".", { "label": "Invocations" } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Fetch Lambda",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 12,
+                            "width": 12,
+                            "height": 3,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-Get", "Resource", "${ServiceName}-${EnvironmentName}-Get", { "label": "Duration", "stat": "Average" } ],
+                                    [ ".", "Errors", ".", ".", ".", ".", { "label": "Errors" } ],
+                                    [ ".", "Throttles", ".", ".", ".", ".", { "label": "Throttles" } ],
+                                    [ ".", "Invocations", ".", ".", ".", ".", { "label": "Invocations" } ]
+                                ],
+                                "view": "singleValue",
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Get Lambda",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 15,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/ApiGateway", "4xx", "Stage", "$default", "ApiId", "${APIGateway}", { "label": "4xx" } ],
+                                    [ ".", "5xx", ".", ".", ".", ".", { "yAxis": "right", "label": "5xx" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "API Gateway Error",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 21,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/ApiGateway", "IntegrationLatency", "Stage", "$default", "ApiId", "${APIGateway}" ],
+                                    [ ".", "Latency", ".", ".", ".", "." ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "API Gateway Integration Latency & Latency",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "x": 0,
+                            "y": 27,
+                            "width": 24,
+                            "height": 1,
+                            "properties": {
+                                "markdown": "\n# Create\n"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 28,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-create", { "stat": "Minimum", "color": "#1f77b4", "label": "Min" } ],
+                                    [ "...", { "label": "Avg", "stat": "Average" } ],
+                                    [ "...", { "yAxis": "right", "color": "#2ca02c", "label": "Max", "stat": "Maximum" } ],
+                                    [ "...", { "yAxis": "left", "label": "P99", "stat": "p99" } ],
+                                    [ "...", { "yAxis": "left", "label": "P95", "stat": "p95" } ],
+                                    [ "...", { "yAxis": "left", "label": "P90", "stat": "p90" } ],
+                                    [ "...", { "yAxis": "left", "label": "P50" } ],
+                                    [ "...", { "yAxis": "left", "stat": "p10", "label": "P10" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "p50",
+                                "period": 300,
+                                "title": "Create Lambda Duration",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 34,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Invocations", "FunctionName", "${ServiceName}-${EnvironmentName}-create", { "yAxis": "right" } ],
+                                    [ ".", "Errors", ".", ".", { "yAxis": "left" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Create Lambda Errors, Invocations",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 40,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-create' | fields @timestamp, @maxMemoryUsed\n| sort @timestamp desc\n| filter(@maxMemoryUsed > 0)\n| DISPLAY @maxMemoryUsed\n| stats avg(@maxMemoryUsed) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "title": "Create Lambda Max Memory Used",
+                                "view": "timeSeries"
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 46,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-create' | fields @timestamp, @duration, @billedDuration, @initDuration\n| sort @timestamp desc\n| filter(@duration > 0)\n| filter(@billedDuration > 0)\n| stats avg(@duration), avg(@billedDuration), avg(@initDuration) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "view": "timeSeries",
+                                "title": "Create Lambda Duration"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 52,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "PutItem", { "stat": "Minimum", "label": "Min" } ],
+                                    [ "...", { "label": "Avg" } ],
+                                    [ "...", { "stat": "Maximum", "yAxis": "right", "label": "Max" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Create Dynamo DB Successful Update Request Latency",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 58,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${ServiceName}-${EnvironmentName}-create" ],
+                                    [ ".", "NumberOfMessagesSent", ".", ".", { "yAxis": "right" } ],
+                                    [ ".", "NumberOfMessagesReceived", ".", ".", { "yAxis": "right" } ],
+                                    [ ".", "NumberOfEmptyReceives", ".", ".", { "yAxis": "right" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Create queue deleted, sent, received and empty messages",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 64,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ServiceName}-${EnvironmentName}-create" ],
+                                    [ ".", "ApproximateNumberOfMessagesNotVisible", ".", "." ],
+                                    [ ".", "ApproximateNumberOfMessagesDelayed", ".", "." ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Create queue visible, not visible & delayed",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 70,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${ServiceName}-${EnvironmentName}-create" ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Create queue oldest message",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+
+                        {
+                            "type": "text",
+                            "x": 0,
+                            "y": 77,
+                            "width": 24,
+                            "height": 1,
+                            "properties": {
+                                "markdown": "\n# Delete\n"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 78,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-delete", { "stat": "Minimum", "color": "#1f77b4", "label": "Min" } ],
+                                    [ "...", { "label": "Avg", "stat": "Average" } ],
+                                    [ "...", { "yAxis": "right", "color": "#2ca02c", "label": "Max", "stat": "Maximum" } ],
+                                    [ "...", { "yAxis": "left", "label": "P99", "stat": "p99" } ],
+                                    [ "...", { "yAxis": "left", "label": "P95", "stat": "p95" } ],
+                                    [ "...", { "yAxis": "left", "label": "P90", "stat": "p90" } ],
+                                    [ "...", { "yAxis": "left", "label": "P50" } ],
+                                    [ "...", { "yAxis": "left", "stat": "p10", "label": "P10" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "p50",
+                                "period": 300,
+                                "title": "Delete Lambda Duration",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 84,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Invocations", "FunctionName", "${ServiceName}-${EnvironmentName}-delete", { "yAxis": "right" } ],
+                                    [ ".", "Errors", ".", ".", { "yAxis": "left" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Delete Lambda Errors, Invocations",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 90,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-delete' | fields @timestamp, @maxMemoryUsed\n| sort @timestamp desc\n| filter(@maxMemoryUsed > 0)\n| DISPLAY @maxMemoryUsed\n| stats avg(@maxMemoryUsed) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "title": "Delete Lambda Max Memory Used",
+                                "view": "timeSeries"
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 96,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-delete' | fields @timestamp, @duration, @billedDuration, @initDuration\n| sort @timestamp desc\n| filter(@duration > 0)\n| filter(@billedDuration > 0)\n| stats avg(@duration), avg(@billedDuration), avg(@initDuration) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "view": "timeSeries",
+                                "title": "Delete Lambda Duration"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 102,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "DeleteItem", { "stat": "Minimum", "label": "Min" } ],
+                                    [ "...", { "label": "Avg" } ],
+                                    [ "...", { "stat": "Maximum", "yAxis": "right", "label": "Max" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Delete Dynamo DB Successful Request Latency",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 108,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "TimeToLiveDeletedItemCount", "TableName", "${ServiceName}-${EnvironmentName}", { "label": "Count" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Delete Dynamo DB TTL Deleted Item Count",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+
+                        {
+                            "type": "text",
+                            "x": 0,
+                            "y": 109,
+                            "width": 24,
+                            "height": 1,
+                            "properties": {
+                                "markdown": "\n# Fetch\n"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 110,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-fetch", { "stat": "Minimum", "color": "#1f77b4", "label": "Min" } ],
+                                    [ "...", { "label": "Avg", "stat": "Average" } ],
+                                    [ "...", { "yAxis": "right", "color": "#2ca02c", "label": "Max", "stat": "Maximum" } ],
+                                    [ "...", { "yAxis": "left", "label": "P99", "stat": "p99" } ],
+                                    [ "...", { "yAxis": "left", "label": "P95", "stat": "p95" } ],
+                                    [ "...", { "yAxis": "left", "label": "P90", "stat": "p90" } ],
+                                    [ "...", { "yAxis": "left", "label": "P50" } ],
+                                    [ "...", { "yAxis": "left", "stat": "p10", "label": "P10" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "p50",
+                                "period": 300,
+                                "title": "Fetch Lambda Duration",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 116,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Invocations", "FunctionName", "${ServiceName}-${EnvironmentName}-fetch", { "yAxis": "right" } ],
+                                    [ ".", "Errors", ".", ".", { "yAxis": "left" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Fetch Lambda Errors, Invocations",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 122,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-fetch' | fields @timestamp, @maxMemoryUsed\n| sort @timestamp desc\n| filter(@maxMemoryUsed > 0)\n| DISPLAY @maxMemoryUsed\n| stats avg(@maxMemoryUsed) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "title": "Fetch Lambda Max Memory Used",
+                                "view": "timeSeries"
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 128,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-fetch' | fields @timestamp, @duration, @billedDuration, @initDuration\n| sort @timestamp desc\n| filter(@duration > 0)\n| filter(@billedDuration > 0)\n| stats avg(@duration), avg(@billedDuration), avg(@initDuration) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "view": "timeSeries",
+                                "title": "Fetch Lambda Duration"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 134,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "Query", { "label": "Min", "yAxis": "left" } ],
+                                    [ "...", { "stat": "Average", "label": "Avg" } ],
+                                    [ "...", { "yAxis": "right", "label": "Max", "stat": "Maximum" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Minimum",
+                                "period": 300,
+                                "title": "Fetch Dynamo DB Successful Query Request Latency",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 140,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "ReturnedItemCount", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "Query", { "stat": "Minimum", "label": "Min" } ],
+                                    [ "...", { "label": "Avg" } ],
+                                    [ "...", { "stat": "Maximum", "yAxis": "right", "label": "Max" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Fetch Dynamo DB Returned Item Count",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+
+                        {
+                            "type": "text",
+                            "x": 0,
+                            "y": 146,
+                            "width": 24,
+                            "height": 1,
+                            "properties": {
+                                "markdown": "\n# Get\n"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 147,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Duration", "FunctionName", "${ServiceName}-${EnvironmentName}-get", { "stat": "Minimum", "color": "#1f77b4", "label": "Min" } ],
+                                    [ "...", { "label": "Avg", "stat": "Average" } ],
+                                    [ "...", { "yAxis": "right", "color": "#2ca02c", "label": "Max", "stat": "Maximum" } ],
+                                    [ "...", { "yAxis": "left", "label": "P99", "stat": "p99" } ],
+                                    [ "...", { "yAxis": "left", "label": "P95", "stat": "p95" } ],
+                                    [ "...", { "yAxis": "left", "label": "P90", "stat": "p90" } ],
+                                    [ "...", { "yAxis": "left", "label": "P50" } ],
+                                    [ "...", { "yAxis": "left", "stat": "p10", "label": "P10" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "p50",
+                                "period": 300,
+                                "title": "Get Lambda Duration",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 153,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/Lambda", "Invocations", "FunctionName", "${ServiceName}-${EnvironmentName}-get", { "yAxis": "right" } ],
+                                    [ ".", "Errors", ".", ".", { "yAxis": "left" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Sum",
+                                "period": 300,
+                                "title": "Get Lambda Errors, Invocations",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 170,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-get' | fields @timestamp, @maxMemoryUsed\n| sort @timestamp desc\n| filter(@maxMemoryUsed > 0)\n| DISPLAY @maxMemoryUsed\n| stats avg(@maxMemoryUsed) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "title": "Get Lambda Max Memory Used",
+                                "view": "timeSeries"
+                            }
+                        },
+                        {
+                            "type": "log",
+                            "x": 0,
+                            "y": 176,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "query": "SOURCE '/aws/lambda/${ServiceName}-${EnvironmentName}-get' | fields @timestamp, @duration, @billedDuration, @initDuration\n| sort @timestamp desc\n| filter(@duration > 0)\n| filter(@billedDuration > 0)\n| stats avg(@duration), avg(@billedDuration), avg(@initDuration) by bin(1m)",
+                                "region": "${AWS::Region}",
+                                "stacked": false,
+                                "view": "timeSeries",
+                                "title": "Get Lambda Duration"
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 182,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "SuccessfulRequestLatency", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "GetItem", { "label": "Min", "yAxis": "left" } ],
+                                    [ "...", { "stat": "Average", "label": "Avg" } ],
+                                    [ "...", { "yAxis": "right", "label": "Max", "stat": "Maximum" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Minimum",
+                                "period": 300,
+                                "title": "Get Dynamo DB Successful Query Request Latency",
+                                "setPeriodToTimeRange": true
+                            }
+                        },
+                        {
+                            "type": "metric",
+                            "x": 0,
+                            "y": 188,
+                            "width": 24,
+                            "height": 6,
+                            "properties": {
+                                "metrics": [
+                                    [ "AWS/DynamoDB", "ReturnedItemCount", "TableName", "${ServiceName}-${EnvironmentName}", "Operation", "GetItem", { "stat": "Minimum", "label": "Min" } ],
+                                    [ "...", { "label": "Avg" } ],
+                                    [ "...", { "stat": "Maximum", "yAxis": "right", "label": "Max" } ]
+                                ],
+                                "view": "timeSeries",
+                                "stacked": false,
+                                "region": "${AWS::Region}",
+                                "stat": "Average",
+                                "period": 300,
+                                "title": "Get Dynamo DB Returned Item Count",
+                                "setPeriodToTimeRange": true
+                            }
+                        }
+                    ]
+                }
+
+    DynamoDB:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            AttributeDefinitions:
+                -   AttributeName: UserId
+                    AttributeType: S
+                -   AttributeName: Id
+                    AttributeType: S
+                -   AttributeName: CreatedDate
+                    AttributeType: S
+            KeySchema:
+                -   AttributeName: UserId
+                    KeyType: HASH
+                -   AttributeName: Id
+                    KeyType: RANGE
+            LocalSecondaryIndexes:
+                -   IndexName: notification-created-date
+                    KeySchema:
+                        -   AttributeName: UserId
+                            KeyType: HASH
+                        -   AttributeName: CreatedDate
+                            KeyType: RANGE
+                    Projection:
+                        ProjectionType: ALL
+            PointInTimeRecoverySpecification:
+                PointInTimeRecoveryEnabled: true
+            TableName: !Sub ${ServiceName}-${EnvironmentName}
+            BillingMode: PAY_PER_REQUEST
+            Tags:
+                -   Key: Environment
+                    Value: !Ref EnvironmentName
+                -   Key: Name
+                    Value: !Ref ServiceName
+                -   Key: Service
+                    Value: !Ref ServiceName
+            TimeToLiveSpecification:
+                AttributeName: ExpirationTime
+                Enabled: true

@@ -1,0 +1,151 @@
+name: Node CI
+
+on:
+    push:
+        branches:
+            - master
+
+jobs:
+    Generate_Build_Number:
+        runs-on: ubuntu-latest
+
+        steps:
+            -   name: Generate build number
+                uses: einaregilsson/build-number@v2
+                with:
+                    token: ${{ secrets.github_token }}
+            -   name: Upload build number
+                uses: actions/upload-artifact@v1
+                with:
+                    name: BUILD_NUMBER
+                    path: BUILD_NUMBER
+
+    Build_V1:
+        runs-on: ubuntu-latest
+        needs: [Generate_Build_Number]
+        strategy:
+            matrix:
+                lambda-name: [create, delete, fetch, get]
+        name: Build ${{matrix.lambda-name}}
+        steps:
+            -   name: Download build number
+                uses: actions/download-artifact@v1
+                with:
+                    name: BUILD_NUMBER
+
+            -   name: Restore build number
+                id: buildnumber
+                uses: einaregilsson/build-number@v2
+
+            -   name: Checkout
+                uses: actions/checkout@v1
+
+            -   name: Use Node.js 12.x
+                uses: actions/setup-node@v1
+                with:
+                    node-version: 12.x
+
+            -   name: Build, Package & Test ${{matrix.lambda-name}} lambda
+                working-directory: ./src/v1/${{matrix.lambda-name}}
+                run: |
+                    npm ci
+                    npm run prebuild
+                    npm run build
+                    npm run coverage
+                    npm run package
+                    echo 'unit test'
+                    echo 'integration test'
+                env:
+                    CI: true
+
+            -   name: Publish ${{matrix.lambda-name}} lambda to S3
+                uses: jakejarvis/s3-sync-action@master
+                with:
+                    args: --exclude '*.js'
+                env:
+                    AWS_S3_BUCKET: ${{ secrets.AWS_S3_REPOSITORY_BUCKET }}
+                    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                    AWS_REGION: 'ap-southeast-2'
+                    SOURCE_DIR: ./src/v1/${{ matrix.lambda-name }}/webpack
+                    DEST_DIR: ${{ matrix.lambda-name }}
+
+            -   shell: bash
+                run: |
+                    a=./src/v1/${{matrix.lambda-name}}/webpack/*.zip
+                    b=$(basename $a)
+                    echo "$b" > ./src/v1/${{matrix.lambda-name}}/webpack/${{matrix.lambda-name}}.txt
+
+            -   name: Upload ${{matrix.lambda-name}} filename
+                uses: actions/upload-artifact@v1
+                with:
+                    name: ${{matrix.lambda-name}}
+                    path: ./src/v1/${{matrix.lambda-name}}/webpack/${{matrix.lambda-name}}.txt
+
+    Deploy-Production:
+        runs-on: ubuntu-latest
+        needs: [Build_V1]
+        steps:
+            -   name: Checkout
+                uses: actions/checkout@v1
+            -   name: Download create file
+                uses: actions/download-artifact@v1
+                with:
+                    name: create
+            -   name: Output create file
+                id: create
+                shell: bash
+                run: |
+                    value=`cat create/create.txt`
+                    echo "::set-output name=filename::$value"
+
+            -   name: Download delete file
+                uses: actions/download-artifact@v1
+                with:
+                    name: delete
+            -   name: Output delete file
+                id: delete
+                shell: bash
+                run: |
+                    value=`cat delete/delete.txt`
+                    echo "::set-output name=filename::$value"
+
+            -   name: Download fetch file
+                uses: actions/download-artifact@v1
+                with:
+                    name: fetch
+            -   name: Output fetch file
+                id: fetch
+                shell: bash
+                run: |
+                    value=`cat fetch/fetch.txt`
+                    echo "::set-output name=filename::$value"
+
+            -   name: Download get file
+                uses: actions/download-artifact@v1
+                with:
+                    name: get
+            -   name: Output get file
+                id: get
+                shell: bash
+                run: |
+                    value=`cat get/get.txt`
+                    echo "::set-output name=filename::$value"
+
+            -   name: Deploy stack
+                shell: bash
+                run: |
+                    mkdir ~/.aws
+                    touch ~/.aws/credentials
+                    touch ~/.aws/config
+                    
+                    echo "[default]
+                    aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+                    aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                    region = ap-southeast-2" > ~/.aws/credentials
+
+                    echo "[default]
+                    output = text
+                    region = ap-southeast-2" > ~/.aws/config
+                    
+                    aws cloudformation deploy --template-file ./cicd/template.yaml --stack-name notification-production --s3-bucket ${{ secrets.AWS_S3_REPOSITORY_BUCKET }} --s3-prefix cloudformation/production  --force-upload  --capabilities  CAPABILITY_NAMED_IAM --parameter-overrides "AlarmActionArn=arn:aws:sns:ap-southeast-2:740876047172:Alarm" "CertificateArn=arn:aws:acm:ap-southeast-2:740876047172:certificate/61e7e826-acf9-48f9-b918-74ba06aff5c9"  "GetFileName=${{ steps.get.outputs.filename }}"  "CreateFileName=${{ steps.create.outputs.filename }}" "CreateQueueSNSTopicArn=arn:aws:sns:ap-southeast-2:740876047172:Test" "DeleteFileName=${{ steps.delete.outputs.filename }}" "FetchFileName=${{ steps.fetch.outputs.filename }}" "HostedZoneUrl=thoud.co" "RepositoryBucketName=${{ secrets.AWS_S3_REPOSITORY_BUCKET }}" "UserJWTIssuer=https://cognito-idp.ap-southeast-2.amazonaws.com/ap-southeast-2_nC0RxIg6O" "UserPoolId=ap-southeast-2_nC0RxIg6O" "UserWebClientId=3j67ab2m7rsdmukrool0he05th" "EnvironmentName=production"
