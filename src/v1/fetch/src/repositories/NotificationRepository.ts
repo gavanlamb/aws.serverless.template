@@ -27,7 +27,7 @@ export class NotificationRepository {
               S: userId,
             },
           },
-          ProjectionExpression: 'Id, Title',
+          ProjectionExpression: 'Id, Title, Body',
         })
         .promise();
 

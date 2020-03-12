@@ -11,6 +11,9 @@ describe('Mapper tests', () => {
             },
             Id: {
                 S: 'Id',
+            },
+            Body:{
+                S: 'Body'
             }
         };
 
@@ -26,6 +29,9 @@ describe('Mapper tests', () => {
             },
             Id: {
                 S: '',
+            },
+            Body:{
+                S: 'Body'
             }
         };
 

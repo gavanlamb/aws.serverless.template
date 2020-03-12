@@ -14,6 +14,9 @@ describe('Notification Repository tests', () => {
                     },
                     Title:  {
                         S: 'Title'
+                    },
+                    Body:{
+                        S: 'Body'
                     }
                 },
                 {
@@ -22,6 +25,9 @@ describe('Notification Repository tests', () => {
                     },
                     Title:  {
                         S: 'Title1'
+                    },
+                    Body:{
+                        S: 'Body'
                     }
                 }
             ]
