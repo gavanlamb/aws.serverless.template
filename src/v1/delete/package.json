@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "aws-lambda": "^1.0.5",
-    "aws-sdk": "^2.600.0",
+    "aws-sdk": "^2.814.0",
     "guid-typescript": "^1.0.9",
     "winston": "^3.2.1"
   },
